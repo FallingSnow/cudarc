@@ -1070,17 +1070,7 @@ pub mod external_memory {
         fd: std::os::fd::RawFd,
         size: u64,
     ) -> Result<sys::CUexternalMemory, DriverError> {
-        let mut external_memory = MaybeUninit::uninit();
-        let handle_description = sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
-            type_: sys::CUexternalMemoryHandleType::CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
-            handle: sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC_st__bindgen_ty_1 { fd },
-            size,
-            ..Default::default()
-        };
-        lib()
-            .cuImportExternalMemory(external_memory.as_mut_ptr(), &handle_description)
-            .result()?;
-        Ok(external_memory.assume_init())
+        import_external_memory(fd, size, sys::CUexternalMemoryHandleType_enum::CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD)
     }
 
     /// Imports an external memory object, in this case an OpaqueWin32 handle.
@@ -1096,9 +1086,50 @@ pub mod external_memory {
         handle: std::os::windows::io::RawHandle,
         size: u64,
     ) -> Result<sys::CUexternalMemory, DriverError> {
+        import_external_memory(handle, size, sys::CUexternalMemoryHandleType_enum::CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32)
+    }
+
+    #[cfg(unix)]
+    // FIXME: This currently only works when memory type is CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD
+    // but should work for CU_EXTERNAL_MEMORY_HANDLE_TYPE_NVSCIBUF too
+    pub unsafe fn import_external_memory(
+        fd: std::os::fd::RawFd,
+        size: u64,
+        type_: sys::CUexternalMemoryHandleType_enum,
+    ) -> Result<sys::CUexternalMemory, DriverError> {
+        // FIXME: Should be removed
+        assert_eq!(type_, sys::CUexternalSemaphoreHandleType_enum::CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD, "This function currently only supports opaque file descriptor type");
         let mut external_memory = MaybeUninit::uninit();
         let handle_description = sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
-            type_: sys::CUexternalMemoryHandleType::CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32,
+            type_,
+            handle: sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC_st__bindgen_ty_1 { fd },
+            size,
+            ..Default::default()
+        };
+        sys::cuImportExternalMemory(external_memory.as_mut_ptr(), &handle_description).result()?;
+        Ok(external_memory.assume_init())
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn import_external_memory(
+        handle: std::os::windows::io::RawHandle,
+        size: u64,
+        type_: sys::CUexternalMemoryHandleType_enum,
+    ) -> Result<sys::CUexternalMemory, DriverError> {
+        let mut external_memory = MaybeUninit::uninit();
+
+        // I guess dedicated flag is needed for D11/D12 resources?
+        // https://docs.nvidia.com/cuda/archive/12.1.0/cuda-driver-api/group__CUDA__EXTRES__INTEROP.html#group__CUDA__EXTRES__INTEROP_1g52aba3a7f780157d8ba12972b2481735
+        // https://github.com/Wabi-Studios/UnrealEngine/blob/eb3ab1c90b5f59477168fd8ceddb671c06ea257a/Engine/Plugins/Media/PixelStreaming/Source/PixelStreaming/Private/EncoderFrameFactory.cpp#L406C43-L406C43
+        let flags = match type_ {
+            sys::CUexternalMemoryHandleType::CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE |
+            sys::CUexternalMemoryHandleType::CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_RESOURCE |
+            sys::CUexternalMemoryHandleType::CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_RESOURCE_KMT => sys::CUDA_EXTERNAL_MEMORY_DEDICATED,
+            _ => 0
+        };
+
+        let handle_description = sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
+            type_,
             handle: sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC_st__bindgen_ty_1 {
                 win32: sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC_st__bindgen_ty_1__bindgen_ty_1 {
                     handle,
@@ -1106,6 +1137,7 @@ pub mod external_memory {
                 },
             },
             size,
+            flags,
             ..Default::default()
         };
         lib()
@@ -1154,5 +1186,40 @@ pub mod external_memory {
             )
             .result()?;
         Ok(device_ptr.assume_init())
+    }
+
+    pub unsafe fn get_mapped_mipmapped_array(
+        external_memory: sys::CUexternalMemory,
+        width: usize,
+        height: usize
+    ) -> Result<sys::CUmipmappedArray, DriverError> {
+
+        let mut array_desc: sys::CUDA_ARRAY3D_DESCRIPTOR = std::mem::MaybeUninit::zeroed().assume_init();
+        array_desc.Width = width;
+        array_desc.Height = height;
+        array_desc.Depth = 0; /* CUDA 2D arrays are defined to have depth 0 */
+        array_desc.Format = sys::CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32;
+        array_desc.NumChannels = 1;
+        array_desc.Flags = sys::CUDA_ARRAY3D_SURFACE_LDST | sys::CUDA_ARRAY3D_COLOR_ATTACHMENT;
+
+        let mut mipmap_array_desc: sys::CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC = std::mem::MaybeUninit::zeroed().assume_init();
+        mipmap_array_desc.arrayDesc = array_desc;
+        mipmap_array_desc.numLevels = 1;
+
+        let mut mipmapped_array = std::mem::MaybeUninit::uninit();
+
+        sys::lib().cuExternalMemoryGetMappedMipmappedArray(mipmapped_array.as_mut_ptr(), external_memory, &mipmap_array_desc).result()?;
+
+        Ok(mipmapped_array.assume_init())
+    }
+
+    pub unsafe fn get_mipmapped_array_level(
+        mipmapped_array: sys::CUmipmappedArray,
+        level: u32
+    ) -> Result<sys::CUarray, DriverError> {
+        let mut array = std::mem::MaybeUninit::uninit();
+        sys::lib().cuMipmappedArrayGetLevel(array.as_mut_ptr(), mipmapped_array, level).result()?;
+
+        Ok(array.assume_init())
     }
 }
